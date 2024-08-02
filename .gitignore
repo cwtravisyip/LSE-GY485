@@ -9,3 +9,4 @@
 /data/*
 /satellite/*
 /*.tif
+/img/*.png
