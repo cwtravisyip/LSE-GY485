@@ -1,0 +1,389 @@
+---
+output:
+  reprex::reprex_document:
+    venue: "gh"
+    advertise: FALSE
+    session_info: TRUE
+    style: TRUE
+    comment: "#;-)"
+    tidyverse_quiet: FALSE
+    std_out_err: TRUE
+knit: reprex::reprex_render
+---
+
+In this notebook, we attempt to compute the food desert index using
+* Satellite imagery to identify population distribution
+* Kernel density estimate of supermarket locations
+
+Since the method 
+
+We attempt to overlay the two rasters as matrices and evaulate the 
+magnitude of the Hadamard product (element-wise multiplication) of the two matrices.
+
+
+```{r set_up}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(stringr)
+library(data.table)
+library(purrr)
+
+library(gstat)
+
+library(sf)
+library(spdep)
+library(tmap)
+library(spatstat)
+library(mapview)
+library(ggplot2)
+library(maptools)
+
+library(raster)
+library(terra)
+# library(rgdal)
+
+conflicts_prefer(dplyr::filter)
+```
+
+## 1. Loading the Data
+Since we will be overlaying the rasters onto the satellite image,
+which are in the crs of 4326.
+
+```{r load_data}
+# load england shp
+eng_shp_path <- file.path("data","eng_boundary_buffer.geojson")
+eng_shp <- read_sf(eng_shp_path)  %>%
+            dpylr::filter(name == "England")
+eng_owin <- as.owin(eng_shp) # in epsg 27700
+
+# load msoa shp
+msoa_path <- file.path("data","MOSA_2021")
+msoa_shp <- read_sf(msoa_path) # in epsg 27700
+
+# load msoa rural urban classification
+ru_class <- read_csv("./data/ons_census_2021.csv")  
+ru_class <- ru_class  %>% 
+          mutate(urb = grepl("Urban",RUC11, fixed = T)) 
+
+# load the supermarkets
+spmkt_path <- file.path("data","amenities_supermarket_processed.geojson")
+spmkt_shp <- read_sf(spmkt_path)  %>% 
+                dpylr::filter(shop == "supermarket")  %>% 
+                st_transform(27700)                
+# add coordinate
+coord <- spmkt_shp %>% 
+    st_coordinates()  %>% 
+    as.data.frame()  
+spmkt_shp <- cbind(spmkt_shp, coord) 
+spmkt_shp_ppp <- as.ppp(spmkt_shp)  
+
+# load the raster
+satellite_paths <- file.path("satellite")  %>% 
+    list.files(full.names = T, pattern = "*.tif")
+```
+
+Return a window object from the the list of supermarkets location to compute the kernel density.
+
+```{r}
+class(eng_shp)
+Window(spmkt_shp_ppp) <- eng_owin
+# visualise the location of the supermarkets
+mapview(spmkt_shp)
+```
+
+## 2. Compute Kernel Densities and Visualise it.
+Method 2 Using ggplot
+https://ggplot2.tidyverse.org/reference/geom_density_2d.html#aesthetics
+In R, I created a kernel density map given a geospatial data. I want to change the way the choropleth map is printed. 
+Specifically, I want to bin the data points into 5 equal quantiles. 
+I saw from the documentation that I can specify the "break" argument in the state_density2d function, passing in a function that takes the kernel density output and return the breaks as output. How can I specify the function?
+```{r}
+# density map data
+spmkt_shp_kernel <- spmkt_shp  %>% 
+                st_crop(eng_shp)
+# Define a custom function to calculate 5 equal quantiles
+quantile_breaks <- function(density_output) {
+  quantile(density_output, probs = seq(0, 1, length.out = 5))
+}
+# define legend labels
+custom_labels <- c("Very Low", "Low", "Medium", "High", "Very High")
+
+
+# create the background map
+eng_background <- ggplot()+
+  geom_sf(data = eng_shp, inherit.aes = FALSE) +  # plot the shapefile
+  xlab("") + ylab("") 
+# overlay kernel density map  
+eng_map <- eng_background +
+          stat_density2d(data=spmkt_shp, # from the ggplot2 package
+                  aes(x=X, y=Y, fill=after_stat(level), 
+                  alpha=after_stat(level)), 
+                  # geom = "raster", contour = F
+                  adjust = 1.5, # control bandwidth
+                  geom="polygon",
+                  ) +
+#  scale_alpha_continuous(range=c(0.25,0.65)) +
+scale_fill_gradientn(colors = rev(viridis::magma(5)), breaks = quantile_breaks, labels = custom_labels) +
+labs(fill = "Supermarket Density") + 
+# scale_color_viridis_d(option = "magma", breaks = quantile_breaks) + 
+ theme(line = element_blank(),    # customize the plot style
+        rect = element_blank(), 
+        axis.text=element_blank()) + 
+ guides(fill=guide_legend("Supermarket"), alpha = "none") # add legend
+
+eng_map  
+
+# ggsave("./img/kernel_density_spmkt.png", dpi = 300)
+
+```
+
+## 3. Compute the Hadamard Product of Urban Classification and Supermarket KDE 
+
+First, let's test for the pipeline before iterating through all the msoa.
+
+```{r viz_sat_img}
+id <- 5  
+# return the msoa
+msoa21cd <- str_extract(satellite_paths[id], "E\\d+")
+msoa_bound <- msoa_shp %>% dplyr::filter(MSOA21CD == msoa21cd)
+# reproject satellite image
+sat_img_temp <- raster(satellite_paths[id]) #in epsg 4326
+
+sat_img_27700 <- projectRaster(sat_img_temp,
+                          crs = CRS("+init=epsg:27700"))
+# return the raster as a df for plotting
+raster_df <- as.data.frame(rasterToPoints(sat_img_27700), xy = TRUE)
+# rename the columns
+colnames(raster_df) <- c("x","y","value")
+# overlay MSOA boundary over raster object
+ggplot() +
+  geom_raster(data = raster_df, aes(x = x, y = y, fill = value)) +
+  scale_fill_gradientn(colours=c("#000000","#FFFFFF")) +  
+  geom_sf(data = msoa_bound, fill = NA, color = "red", linewidth = 2) +
+   theme(
+    axis.line = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title = element_blank(),
+    panel.grid = element_blank(),
+    panel.background = element_blank(),
+    legend.position = "none"
+  ) 
+ggsave("./img/E02000068_overlay.png")
+```
+
+From the output above, we observe that the raster is aligned with the shapefile that st_coordinates
+the adminstrative boundary of the MSOAs.
+
+The below chunk requires the input of :
+* specified MSOA satellite image `sat_img_27700`
+* Boundary of the MSOA `msoa_bound`
+
+```{r}
+# return the extent of the raster
+mask <- raster::raster(sat_img_27700)
+# rasterize the msoa boundary
+mask <- rasterize(msoa_bound, mask, field=1, fun='first')
+
+# Get the matrix representation of the raster and the mask
+raster_matrix <- as.matrix(sat_img_27700)
+mask_matrix <- as.matrix(mask)
+
+# Perform the Hadamard product
+result_matrix <- raster_matrix * mask_matrix
+
+# Create a new raster object from the result matrix
+result_raster <- raster(result_matrix)
+
+# Set the extent and CRS of the new raster to match the original raster
+extent(result_raster) <- extent(sat_img_27700)
+crs(result_raster) <- crs(sat_img_27700)
+
+
+# Compute the kde of the supermarkets
+# return the buffer dimension of the msoa dependent on rural urban classifiation
+urbs <- ru_class  %>% dplyr::filter(MSOA21CD == msoa21cd)  %>% dplyr::select("urb")
+if (urbs[[1,1]]){
+  buffer <- 1000
+} else {buffer <- 5000}
+
+# return the relevant subset of supermarket
+# Create a 10km buffer around the polygon
+buffer_bound <- st_buffer(msoa_bound, dist = buffer + 1)
+pois_within_buffer <- spmkt_shp[st_within(spmkt_shp, buffer_bound, sparse = FALSE), ]
+# Convert POIs to SpatialPoints
+pois_sp <- as(pois_within_buffer, "Spatial")
+# Define the window (extent) of the KDE to match the result raster
+ext <- extent(result_raster)
+win <- as.owin(as(ext, "SpatialPolygons"))
+
+# Convert to ppp object
+pois_ppp <- as(pois_sp, "ppp")
+pois_ppp$window <- win
+
+# Define the resolution to match the result_raster
+res_x <- xres(result_raster)
+res_y <- yres(result_raster)
+
+# Perform KDE using spatstat
+kde <- density(pois_ppp, sigma = buffer, at = "pixels", eps = c(res_x, res_y))
+
+# Convert KDE result to raster
+kde_raster <- raster(kde, crs=crs(result_raster))
+
+if (!all(dim(kde_raster) == dim(result_raster))) {
+  stop("The dimensions of the KDE raster and the result raster do not match.")
+}
+
+# Convert rasters to matrices
+kde_matrix <- as.matrix(kde_raster)
+
+# Perform the Hadamard product
+hadamard_matrix <- kde_matrix * result_matrix
+
+# Create a new raster object from the result matrix
+hadamard_raster <- raster(hadamard_matrix)
+
+# Set the extent and CRS of the new raster to match the original rasters
+extent(hadamard_raster) <- extent(result_raster)
+crs(hadamard_raster) <- crs(result_raster)
+
+# Validation visualisation 
+# return the raster as a df for plotting
+raster_df <- as.data.frame(rasterToPoints(hadamard_raster), xy = TRUE)
+a <- max(raster_df$layer)
+
+ggplot() +
+  geom_raster(data = raster_df, aes(x = x, y = y, fill = layer)) +
+  scale_fill_gradientn(colours=c("#FFFFFF","#048EF8"), name = "Supermarket KDE"
+          # limits = c(0, a)
+          ) +  
+  geom_sf(data = msoa_bound, fill = NA, color = "red", linewidth = 2) +
+  geom_sf(data = pois_within_buffer, aes(shape = "Supermarket"), size  =3) + 
+   scale_shape_manual(name = "", values = c("Supermarket" = 16)) +
+   theme(
+    axis.line = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title = element_blank(),
+    panel.grid = element_blank(),
+    panel.background = element_blank(),
+    # legend.position = "none"
+  ) 
+
+# -------------------
+```
+
+From the visualisation, this seems like a possible method to compute food access.
+Let's compute the average value of KDE density within the built up area in the MSOA.
+```{r}
+dplyr::summarise(spmkt_ind_rast)
+mean(spmkt_ind_rast$layer)
+```
+
+Let's pack all the codes above into a function
+```{r}
+compute_spmkt <- function(file_path){
+    # return the msoa code and boundary given the file path
+    msoa21cd <- str_extract(file_path, "E\\d+")
+    msoa_bound <- msoa_shp %>% dplyr::filter(MSOA21CD == msoa21cd)
+    # load and reproject satellite image
+    sat_img_temp <- raster(file_path) #in epsg 4326
+    sat_img_27700 <- projectRaster(sat_img_temp,
+                            crs = CRS("+init=epsg:27700"))
+    # return the raster as a df for plotting
+    raster_df <- as.data.frame(rasterToPoints(sat_img_27700), xy = TRUE)
+    # rename the columns
+    colnames(raster_df) <- c("x","y","value")
+
+    # mask the urban classifiaction raster
+    # return the extent of the raster
+    mask <- raster::raster(sat_img_27700)
+    # rasterize the msoa boundary
+    mask <- rasterize(msoa_bound, mask, field=1, fun='first')
+
+    # Get the matrix representation of the raster and the mask
+    raster_matrix <- as.matrix(sat_img_27700)
+    mask_matrix <- as.matrix(mask)
+
+    # Perform the Hadamard product -------------
+    result_matrix <- raster_matrix * mask_matrix
+
+    # Create a new raster object from the result matrix
+    result_raster <- raster(result_matrix)
+
+    # Set the extent and CRS of the new raster to match the original raster
+    extent(result_raster) <- extent(sat_img_27700)
+    crs(result_raster) <- crs(sat_img_27700)
+
+    # Compute the kde of the supermarkets ------------------
+    # return the buffer dimension of the msoa dependent on rural urban classifiation
+    urbs <- ru_class  %>% filter(MSOA21CD == msoa21cd)  %>% dplyr::select("urb")
+    if (urbs[[1,1]]){
+      buffer <- 1000
+    } else {buffer <- 5000}
+
+    # return the relevant subset of supermarket
+    # Create a 1/5 km buffer around the polygon
+    buffer_bound <- st_buffer(msoa_bound, dist = buffer + 1)
+    pois_within_buffer <- spmkt_shp[st_within(spmkt_shp, buffer_bound, sparse = FALSE), ]
+    # Convert POIs to SpatialPoints
+    pois_sp <- as(pois_within_buffer, "Spatial")
+    # Define the window (extent) of the KDE to match the result raster
+    ext <- extent(result_raster)
+    win <- as.owin(as(ext, "SpatialPolygons"))
+
+    # Convert to ppp object
+    pois_ppp <- as(pois_sp, "ppp")
+    pois_ppp$window <- win
+
+    # Define the resolution to match the result_raster
+    res_x <- xres(result_raster)
+    res_y <- yres(result_raster)
+
+    # Perform KDE using spatstat
+    kde <- density(pois_ppp, sigma = buffer, at = "pixels", eps = c(res_x, res_y))
+
+    # Convert KDE result to raster
+    kde_raster <- raster(kde, crs=crs(result_raster))
+
+    if (!all(dim(kde_raster) == dim(result_raster))) {
+      stop("The dimensions of the KDE raster and the result raster do not match.")
+    }
+
+    # Convert rasters to matrices
+    kde_matrix <- as.matrix(kde_raster)
+
+    # Perform the Hadamard product
+    hadamard_matrix <- kde_matrix * result_matrix
+
+    # Create a new raster object from the result matrix and parse as df
+    hadamard_raster <- raster(hadamard_matrix)
+    raster_df <- as.data.frame(rasterToPoints(hadamard_raster), xy = TRUE)
+
+    # output the value 
+    val <- mean(raster_df$layer)
+    return(val[[1]])
+}
+```
+
+### 3.1 Iterate Through the MSOA
+```{r}
+#instantiate an empty list to store the result
+spmkt_res <- list()
+
+for (path in satellite_paths[1:5]){
+  value <- compute_spmkt(path)
+  print(paste0("the value is ", value))
+  msoacd21 <- str_extract(path, "E\\d+")
+  spmkt_res[[msoacd21]] <- value
+}
+
+df <- tibble::enframe(spmkt_res, name = "MSOA21CD", value = "value")  %>% 
+    mutate(value = map_dbl(value, ~ .x))
+df
+# write.csv(df, "./data/spmkt_spec_satellite.csv")
+```
+
+
