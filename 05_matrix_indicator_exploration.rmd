@@ -24,10 +24,11 @@ magnitude of the Hadamard product (element-wise multiplication) of the two matri
 ```{r set_up}
 knitr::opts_chunk$set(echo = TRUE)
 
-library(dplyr)
+
 library(stringr)
 library(data.table)
 library(purrr)
+library(dplyr)
 
 library(gstat)
 
@@ -42,8 +43,6 @@ library(maptools)
 library(raster)
 library(terra)
 # library(rgdal)
-
-conflicts_prefer(dplyr::filter)
 ```
 
 ## 1. Loading the Data
@@ -54,22 +53,22 @@ which are in the crs of 4326.
 # load england shp
 eng_shp_path <- file.path("data","eng_boundary_buffer.geojson")
 eng_shp <- read_sf(eng_shp_path)  %>%
-            dpylr::filter(name == "England")
+            dplyr::filter(name == "England")
 eng_owin <- as.owin(eng_shp) # in epsg 27700
 
 # load msoa shp
-msoa_path <- file.path("data","MOSA_2021")
+msoa_path <- file.path("data","MSOA_2021")
 msoa_shp <- read_sf(msoa_path) # in epsg 27700
 
 # load msoa rural urban classification
-ru_class <- read_csv("./data/ons_census_2021.csv")  
+ru_class <- read.csv("./data/ons_census_2021.csv")  
 ru_class <- ru_class  %>% 
           mutate(urb = grepl("Urban",RUC11, fixed = T)) 
 
 # load the supermarkets
 spmkt_path <- file.path("data","amenities_supermarket_processed.geojson")
 spmkt_shp <- read_sf(spmkt_path)  %>% 
-                dpylr::filter(shop == "supermarket")  %>% 
+                dplyr::filter(shop == "supermarket")  %>% 
                 st_transform(27700)                
 # add coordinate
 coord <- spmkt_shp %>% 
@@ -85,7 +84,7 @@ satellite_paths <- file.path("satellite")  %>%
 
 Return a window object from the the list of supermarkets location to compute the kernel density.
 
-```{r}
+```{r win_obj_spmkt}
 class(eng_shp)
 Window(spmkt_shp_ppp) <- eng_owin
 # visualise the location of the supermarkets
@@ -97,8 +96,8 @@ Method 2 Using ggplot
 https://ggplot2.tidyverse.org/reference/geom_density_2d.html#aesthetics
 In R, I created a kernel density map given a geospatial data. I want to change the way the choropleth map is printed. 
 Specifically, I want to bin the data points into 5 equal quantiles. 
-I saw from the documentation that I can specify the "break" argument in the state_density2d function, passing in a function that takes the kernel density output and return the breaks as output. How can I specify the function?
-```{r}
+
+```{r viz_kde}
 # density map data
 spmkt_shp_kernel <- spmkt_shp  %>% 
                 st_crop(eng_shp)
@@ -143,7 +142,7 @@ eng_map
 First, let's test for the pipeline before iterating through all the msoa.
 
 ```{r viz_sat_img}
-id <- 5  
+id <- 66
 # return the msoa
 msoa21cd <- str_extract(satellite_paths[id], "E\\d+")
 msoa_bound <- msoa_shp %>% dplyr::filter(MSOA21CD == msoa21cd)
@@ -156,11 +155,29 @@ sat_img_27700 <- projectRaster(sat_img_temp,
 raster_df <- as.data.frame(rasterToPoints(sat_img_27700), xy = TRUE)
 # rename the columns
 colnames(raster_df) <- c("x","y","value")
+
+raster_df$value <- as.factor(ifelse(is.na(raster_df$value), "NA", as.character(raster_df$value)))
+# Create a dummy data frame for the boundary line to be included in the legend
+boundary_legend <- data.frame(
+  x = NA, y = NA, label = "Boundary"
+)
+
 # overlay MSOA boundary over raster object
 ggplot() +
   geom_raster(data = raster_df, aes(x = x, y = y, fill = value)) +
-  scale_fill_gradientn(colours=c("#000000","#FFFFFF")) +  
-  geom_sf(data = msoa_bound, fill = NA, color = "red", linewidth = 2) +
+  scale_fill_manual(
+    values = c("NA" = "#FFFFFF", "1" = "#E3978B"),
+    labels = c("NA" = "Non-residential", "1" = "Residential"),
+    name = ""
+  )+
+  # scale_fill_gradientn(colours=c("#000000","#FFFFFF")) +  
+  geom_sf(data = msoa_bound, fill = "#cdcdcd55", color ="#8EAAC0", linewidth = 2) +
+  geom_sf(data = msoa_bound, aes(color = "Boundary"), fill = NA, linewidth = 1, show.legend = TRUE) +
+    scale_color_manual(
+    values = c("Boundary" = "#8EAAC0"),
+    labels = c("Boundary" = "Bexley 004 MSOA"),
+    name = "Legend"
+  ) + 
    theme(
     axis.line = element_blank(),
     axis.text = element_blank(),
@@ -168,7 +185,6 @@ ggplot() +
     axis.title = element_blank(),
     panel.grid = element_blank(),
     panel.background = element_blank(),
-    legend.position = "none"
   ) 
 ggsave("./img/E02000068_overlay.png")
 ```
@@ -180,7 +196,7 @@ The below chunk requires the input of :
 * specified MSOA satellite image `sat_img_27700`
 * Boundary of the MSOA `msoa_bound`
 
-```{r}
+```{r est_fd_ind}
 # return the extent of the raster
 mask <- raster::raster(sat_img_27700)
 # rasterize the msoa boundary
@@ -201,6 +217,35 @@ extent(result_raster) <- extent(sat_img_27700)
 crs(result_raster) <- crs(sat_img_27700)
 
 
+# show the masked residential area
+ggplot() +
+  geom_raster(data = result_raster, aes(x = x, y = y, fill = value)) +
+  scale_fill_manual(
+    values = c("NA" = "#FFFFFF", "1" = "#E3978B"),
+    labels = c("NA" = "Non-residential", "1" = "Residential"),
+    name = ""
+  )+
+  # scale_fill_gradientn(colours=c("#000000","#FFFFFF")) +  
+  geom_sf(data = msoa_bound, fill = "#cdcdcd55", color ="#8EAAC0", linewidth = 2) +
+  geom_sf(data = msoa_bound, aes(color = "Boundary"), fill = NA, linewidth = 1, show.legend = TRUE) +
+    scale_color_manual(
+    values = c("Boundary" = "#8EAAC0"),
+    labels = c("Boundary" = "Bexley 004 MSOA"),
+    name = "Legend"
+  ) + 
+   theme(
+    axis.line = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title = element_blank(),
+    panel.grid = element_blank(),
+    panel.background = element_blank(),
+  ) 
+
+```
+
+
+```{r kde_est}
 # Compute the kde of the supermarkets
 # return the buffer dimension of the msoa dependent on rural urban classifiation
 urbs <- ru_class  %>% dplyr::filter(MSOA21CD == msoa21cd)  %>% dplyr::select("urb")
@@ -277,13 +322,13 @@ ggplot() +
 
 From the visualisation, this seems like a possible method to compute food access.
 Let's compute the average value of KDE density within the built up area in the MSOA.
-```{r}
+```{r msoa_summary}
 dplyr::summarise(spmkt_ind_rast)
 mean(spmkt_ind_rast$layer)
 ```
 
 Let's pack all the codes above into a function
-```{r}
+```{r kde_func}
 compute_spmkt <- function(file_path){
     # return the msoa code and boundary given the file path
     msoa21cd <- str_extract(file_path, "E\\d+")
@@ -369,21 +414,87 @@ compute_spmkt <- function(file_path){
 ```
 
 ### 3.1 Iterate Through the MSOA
+
+First, we need to find the list of MSOAs that satify the following:
+* Was not recorded in `./data/spmkt_spec_satellite.csv`
+* Satellite image is export
+
+```{r for_loop_kde_est}
+# find the list of MSOAs for which, we have the satellite image
+# return the list of msoa and their satellite image
+# load the raster
+satellite_paths <- file.path("satellite")  %>% 
+    list.files(full.names = T, pattern = "*.tif")
+file_ids <- str_extract(satellite_paths, "E\\d+")
+
+# return the list of msoas recorded
+if (file.exists("./data/spmkt_spec_satellite.csv")){
+                  msoa_processed <- read.csv("./data/spmkt_spec_satellite.csv") %>%
+                  dplyr::select("MSOA21CD")
+    } else {msoa_processed <- data.frame(MSOA21CD = NA)}                
+
+# Find exclusive IDs
+exclusive_ids <- setdiff(file_ids, msoa_processed$MSOA21CD)
+
+# Subset file paths based on exclusive IDs
+exclusive_file_paths <- satellite_paths[file_ids %in% exclusive_ids]
+
+length(exclusive_file_paths)
+```
+
+
+Now, we can iterate through the msoas for which we can process to compute the food desert indicator.
+
 ```{r}
 #instantiate an empty list to store the result
 spmkt_res <- list()
+error_list <- c()
 
-for (path in satellite_paths[1:5]){
-  value <- compute_spmkt(path)
-  print(paste0("the value is ", value))
-  msoacd21 <- str_extract(path, "E\\d+")
-  spmkt_res[[msoacd21]] <- value
+for (path in exclusive_file_paths){
+  tryCatch(
+            {value <- compute_spmkt(path)
+            # print(paste0("the value is ", value))
+            msoacd21 <- str_extract(path, "E\\d+")
+            spmkt_res[[msoacd21]] <- value
+            },
+    error = function(e){
+          print(paste0("An error occured for ", str_extract(path, "E\\d+")))
+          error_list <-c(error_list,str_extract(path, "E\\d+")) }
+  )
 }
 
 df <- tibble::enframe(spmkt_res, name = "MSOA21CD", value = "value")  %>% 
     mutate(value = map_dbl(value, ~ .x))
-df
-# write.csv(df, "./data/spmkt_spec_satellite.csv")
+
+# export the data
+file_path <- file.path(".","data","spmkt_spec_satellite.csv")
+if (file.exists(file_path)){
+  # specify row names
+  id_max <- read.csv(file_path)  %>% dplyr::select(X)  %>% max()
+  rownames(df) <- c((id_max + 1): (id_max + dim(df)[1]))
+  # append row to existing csv
+  write.table(df, file = file_path, sep = ",", col.names = FALSE, append = TRUE)
+
+  } else {write.csv(df, file_path)}
+
 ```
+
+
+
+### 3.2 Exploratory visualisation
+
+```{r}
+# merge the
+temp <- msoa_shp  %>%   
+  left_join(df, by = "MSOA21CD")  %>% 
+  mutate(value = as.numeric(value))
+
+# create plot
+ggplot(temp) +
+geom_sf(aes(value)) +
+scale_fill_viridis_c() + 
+theme_void()
+```
+
 
 
